@@ -1,0 +1,801 @@
+# ====================================================================
+
+# CONFIGURACIÓN INICIAL Y SISTEMA DE MACHINE LEARNING
+
+# ====================================================================
+
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingRegressor
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, mean_squared_error
+import joblib
+import json
+from datetime import datetime, timedelta
+from typing import Dict, List, Any, Tuple
+import psycopg2
+from psycopg2.extras import RealDictCursor
+
+# ====================================================================
+
+# 1. SCRIPT DE CONFIGURACIÓN INICIAL DE BASE DE DATOS
+
+# ====================================================================
+
+class DatabaseSetup:
+“”“Configuración inicial de la base de datos PostgreSQL”””
+
+```
+@staticmethod
+def get_setup_sql() -> str:
+    """Retorna el SQL completo para configurar la base de datos"""
+    return """
+    -- Crear base de datos (ejecutar como superusuario)
+    -- CREATE DATABASE ai_agents_db;
+    
+    -- Extensiones necesarias
+    CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+    CREATE EXTENSION IF NOT EXISTS "pg_trgm";
+    
+    -- Tabla de agentes con campos adicionales para ML
+    CREATE TABLE IF NOT EXISTS agents (
+        agent_id VARCHAR(255) PRIMARY KEY,
+        agent_type VARCHAR(50) NOT NULL,
+        specialization VARCHAR(255),
+        capabilities JSONB,
+        config JSONB,
+        performance_metrics JSONB DEFAULT '{}',
+        learning_parameters JSONB DEFAULT '{}',
+        model_version VARCHAR(50) DEFAULT 'v1.0',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        last_training TIMESTAMP,
+        is_active BOOLEAN DEFAULT TRUE
+    );
+    
+    -- Tabla de tareas extendida
+    CREATE TABLE IF NOT EXISTS tasks (
+        task_id VARCHAR(255) PRIMARY KEY,
+        description TEXT NOT NULL,
+        agent_ids JSONB,
+        status VARCHAR(50) DEFAULT 'pending',
+        priority INTEGER DEFAULT 1,
+        collaboration_type VARCHAR(50) DEFAULT 'solo',
+        dependencies JSONB DEFAULT '[]',
+        task_complexity FLOAT DEFAULT 0.5,
+        estimated_duration INTEGER, -- en minutos
+        actual_duration INTEGER,
+        result JSONB,
+        quality_score FLOAT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        started_at TIMESTAMP,
+        completed_at TIMESTAMP
+    );
+    
+    -- Tabla de interacciones entre agentes
+    CREATE TABLE IF NOT EXISTS agent_interactions (
+        interaction_id SERIAL PRIMARY KEY,
+        agent_from VARCHAR(255) REFERENCES agents(agent_id),
+        agent_to VARCHAR(255) REFERENCES agents(agent_id),
+        task_id VARCHAR(255) REFERENCES tasks(task_id),
+        interaction_type VARCHAR(50),
+        content JSONB,
+        success_rate FLOAT,
+        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    
+    -- Tabla de datos de aprendizaje enriquecida
+    CREATE TABLE IF NOT EXISTS learning_data (
+        record_id SERIAL PRIMARY KEY,
+        agent_id VARCHAR(255) REFERENCES agents(agent_id),
+        task_id VARCHAR(255) REFERENCES tasks(task_id),
+        input_features JSONB,
+        output_prediction JSONB,
+        actual_result JSONB,
+        performance_score FLOAT,
+        execution_time FLOAT,
+        context_factors JSONB,
+        feedback JSONB,
+        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    
+    -- Tabla de versiones de modelos de agentes
+    CREATE TABLE IF NOT EXISTS agent_model_versions (
+        version_id SERIAL PRIMARY KEY,
+        agent_id VARCHAR(255) REFERENCES agents(agent_id),
+        version_number VARCHAR(50),
+        model_type VARCHAR(100),
+        model_parameters JSONB,
+        training_data_size INTEGER,
+        validation_score FLOAT,
+        deployment_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        is_active BOOLEAN DEFAULT TRUE
+    );
+    
+    -- Tabla de métricas de rendimiento histórico
+    CREATE TABLE IF NOT EXISTS performance_history (
+        metric_id SERIAL PRIMARY KEY,
+        agent_id VARCHAR(255) REFERENCES agents(agent_id),
+        metric_type VARCHAR(100),
+        metric_value FLOAT,
+        metric_context JSONB,
+        measurement_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    
+    -- Tabla de configuraciones de fine-tuning
+    CREATE TABLE IF NOT EXISTS tuning_configurations (
+        config_id SERIAL PRIMARY KEY,
+        agent_id VARCHAR(255) REFERENCES agents(agent_id),
+        tuning_type VARCHAR(100),
+        hyperparameters JSONB,
+        training_schedule JSONB,
+        target_metrics JSONB,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        is_active BOOLEAN DEFAULT TRUE
+    );
+    
+    -- Índices para optimización
+    CREATE INDEX IF NOT EXISTS idx_agents_type_spec ON agents(agent_type, specialization);
+    CREATE INDEX IF NOT EXISTS idx_tasks_status_priority ON tasks(status, priority);
+    CREATE INDEX IF NOT EXISTS idx_learning_data_agent_time ON learning_data(agent_id, timestamp);
+    CREATE INDEX IF NOT EXISTS idx_performance_agent_metric ON performance_history(agent_id, metric_type);
+    CREATE INDEX IF NOT EXISTS idx_interactions_agents_time ON agent_interactions(agent_from, agent_to, timestamp);
+    
+    -- Función para actualizar timestamp automáticamente
+    CREATE OR REPLACE FUNCTION update_updated_at_column()
+    RETURNS TRIGGER AS $$
+    BEGIN
+        NEW.updated_at = CURRENT_TIMESTAMP;
+        RETURN NEW;
+    END;
+    $$ language 'plpgsql';
+    
+    -- Trigger para actualizar updated_at automáticamente
+    CREATE TRIGGER update_agents_updated_at BEFORE UPDATE
+        ON agents FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+    
+    -- Vistas útiles para análisis
+    CREATE OR REPLACE VIEW agent_performance_summary AS
+    SELECT 
+        a.agent_id,
+        a.agent_type,
+        a.specialization,
+        COUNT(t.task_id) as total_tasks,
+        AVG(t.quality_score) as avg_quality,
+        AVG(t.actual_duration) as avg_duration,
+        MAX(t.completed_at) as last_activity
+    FROM agents a
+    LEFT JOIN tasks t ON a.agent_id = ANY(SELECT jsonb_array_elements_text(t.agent_ids))
+    WHERE a.is_active = TRUE
+    GROUP BY a.agent_id, a.agent_type, a.specialization;
+    
+    CREATE OR REPLACE VIEW collaboration_effectiveness AS
+    SELECT 
+        t.collaboration_type,
+        COUNT(*) as total_collaborations,
+        AVG(t.quality_score) as avg_quality,
+        AVG(t.actual_duration) as avg_duration,
+        COUNT(CASE WHEN t.status = 'completed' THEN 1 END) * 100.0 / COUNT(*) as success_rate
+    FROM tasks t
+    WHERE t.collaboration_type != 'solo'
+    GROUP BY t.collaboration_type;
+    """
+
+@staticmethod
+def create_sample_data_sql() -> str:
+    """Crea datos de ejemplo para testing"""
+    return """
+    -- Insertar datos de ejemplo
+    INSERT INTO agents (agent_id, agent_type, specialization, capabilities) VALUES
+    ('demo_analyst', 'specialist', 'data_analysis', '["pattern_recognition", "statistical_analysis"]'),
+    ('demo_coordinator', 'specialist', 'task_coordination', '["project_management", "resource_allocation"]'),
+    ('demo_reviewer', 'reviewer', 'quality_assurance', '["quality_review", "performance_analysis"]')
+    ON CONFLICT (agent_id) DO NOTHING;
+    
+    -- Insertar tareas de ejemplo
+    INSERT INTO tasks (task_id, description, agent_ids, status, collaboration_type, quality_score, actual_duration) VALUES
+    ('task_001', 'Análisis de datos Q1', '["demo_analyst"]', 'completed', 'solo', 0.85, 45),
+    ('task_002', 'Coordinación proyecto Alpha', '["demo_coordinator"]', 'completed', 'solo', 0.92, 60),
+    ('task_003', 'Revisión conjunta proyecto Beta', '["demo_analyst", "demo_reviewer"]', 'completed', 'parallel', 0.88, 75)
+    ON CONFLICT (task_id) DO NOTHING;
+    """
+```
+
+# ====================================================================
+
+# 2. SISTEMA DE MACHINE LEARNING PARA AGENTES
+
+# ====================================================================
+
+class AgentMLSystem:
+“”“Sistema de Machine Learning para entrenar y optimizar agentes”””
+
+```
+def __init__(self, db_manager):
+    self.db = db_manager
+    self.models = {}
+    self.scalers = {}
+    self.encoders = {}
+    
+def extract_features_from_task(self, task_data: Dict) -> Dict:
+    """Extrae características de una tarea para el modelo"""
+    features = {
+        'task_length': len(task_data.get('description', '')),
+        'priority': task_data.get('priority', 1),
+        'agent_count': len(task_data.get('agent_ids', [])),
+        'collaboration_type_solo': 1 if task_data.get('collaboration_type') == 'solo' else 0,
+        'collaboration_type_parallel': 1 if task_data.get('collaboration_type') == 'parallel' else 0,
+        'collaboration_type_sequential': 1 if task_data.get('collaboration_type') == 'sequential' else 0,
+        'estimated_duration': task_data.get('estimated_duration', 30),
+        'task_complexity': task_data.get('task_complexity', 0.5)
+    }
+    
+    # Agregar características temporales
+    if 'created_at' in task_data:
+        created_at = task_data['created_at']
+        if isinstance(created_at, str):
+            created_at = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+        
+        features.update({
+            'hour_of_day': created_at.hour,
+            'day_of_week': created_at.weekday(),
+            'is_weekend': 1 if created_at.weekday() >= 5 else 0
+        })
+    
+    return features
+
+def prepare_training_data(self, agent_id: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Prepara datos de entrenamiento para un agente específico"""
+    
+    cursor = self.db.connection.cursor(cursor_factory=RealDictCursor)
+    
+    # Obtiene datos históricos del agente
+    cursor.execute("""
+        SELECT 
+            t.task_id, t.description, t.priority, t.collaboration_type,
+            t.estimated_duration, t.actual_duration, t.quality_score,
+            t.task_complexity, t.created_at, t.agent_ids,
+            ld.input_features, ld.performance_score, ld.execution_time
+        FROM tasks t
+        JOIN learning_data ld ON t.task_id = ld.task_id
+        WHERE ld.agent_id = %s AND t.status = 'completed'
+        ORDER BY t.completed_at DESC
+        LIMIT 1000
+    """, (agent_id,))
+    
+    data = cursor.fetchall()
+    cursor.close()
+    
+    if not data:
+        print(f"⚠️ No hay datos de entrenamiento para el agente {agent_id}")
+        return np.array([]), np.array([]), np.array([])
+    
+    # Procesa las características
+    features_list = []
+    quality_targets = []
+    duration_targets = []
+    
+    for row in data:
+        # Extrae características de la tarea
+        task_features = self.extract_features_from_task(dict(row))
+        
+        # Agrega características específicas del input
+        if row['input_features']:
+            input_features = json.loads(row['input_features']) if isinstance(row['input_features'], str) else row['input_features']
+            task_features.update(input_features)
+        
+        features_list.append(list(task_features.values()))
+        quality_targets.append(row['quality_score'] or 0.5)
+        duration_targets.append(row['actual_duration'] or row['estimated_duration'] or 30)
+    
+    return np.array(features_list), np.array(quality_targets), np.array(duration_targets)
+
+def train_agent_models(self, agent_id: str) -> Dict:
+    """Entrena modelos de ML para un agente específico"""
+    
+    print(f"🎯 Iniciando entrenamiento para agente {agent_id}")
+    
+    # Prepara datos
+    X, y_quality, y_duration = self.prepare_training_data(agent_id)
+    
+    if len(X) == 0:
+        return {"error": "No hay datos suficientes para entrenar"}
+    
+    if len(X) < 10:
+        print(f"⚠️ Pocos datos disponibles ({len(X)} muestras). Recomendado: 50+")
+    
+    # Divide datos
+    X_train, X_test, y_quality_train, y_quality_test, y_duration_train, y_duration_test = train_test_split(
+        X, y_quality, y_duration, test_size=0.2, random_state=42
+    )
+    
+    # Escala características
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
+    
+    # Entrena modelo de predicción de calidad
+    quality_model = RandomForestClassifier(n_estimators=100, random_state=42)
+    
+    # Convierte calidad a categorías
+    quality_categories = (y_quality_train > 0.7).astype(int)  # 1 = alta calidad, 0 = baja calidad
+    quality_model.fit(X_train_scaled, quality_categories)
+    
+    # Entrena modelo de predicción de duración
+    duration_model = GradientBoostingRegressor(n_estimators=100, random_state=42)
+    duration_model.fit(X_train_scaled, y_duration_train)
+    
+    # Evalúa modelos
+    quality_test_categories = (y_quality_test > 0.7).astype(int)
+    quality_accuracy = accuracy_score(quality_test_categories, quality_model.predict(X_test_scaled))
+    duration_rmse = np.sqrt(mean_squared_error(y_duration_test, duration_model.predict(X_test_scaled)))
+    
+    # Guarda modelos
+    model_key = f"{agent_id}_quality"
+    self.models[model_key] = quality_model
+    self.scalers[model_key] = scaler
+    
+    duration_key = f"{agent_id}_duration"
+    self.models[duration_key] = duration_model
+    self.scalers[duration_key] = scaler
+    
+    # Guarda en archivo
+    self.save_agent_model(agent_id, quality_model, duration_model, scaler)
+    
+    # Actualiza base de datos
+    self.save_training_results(agent_id, quality_accuracy, duration_rmse, len(X))
+    
+    results = {
+        "success": True,
+        "agent_id": agent_id,
+        "training_samples": len(X),
+        "quality_accuracy": quality_accuracy,
+        "duration_rmse": duration_rmse,
+        "model_version": f"v{datetime.now().strftime('%Y%m%d_%H%M')}"
+    }
+    
+    print(f"✅ Entrenamiento completado: {results}")
+    return results
+
+def save_agent_model(self, agent_id: str, quality_model, duration_model, scaler):
+    """Guarda modelos entrenados en archivos"""
+    import os
+    
+    # Crea directorio si no existe
+    model_dir = f"models/{agent_id}"
+    os.makedirs(model_dir, exist_ok=True)
+    
+    # Guarda modelos
+    joblib.dump(quality_model, f"{model_dir}/quality_model.pkl")
+    joblib.dump(duration_model, f"{model_dir}/duration_model.pkl")
+    joblib.dump(scaler, f"{model_dir}/scaler.pkl")
+    
+    print(f"💾 Modelos guardados en {model_dir}")
+
+def load_agent_model(self, agent_id: str) -> bool:
+    """Carga modelos entrenados desde archivos"""
+    try:
+        model_dir = f"models/{agent_id}"
+        
+        quality_model = joblib.load(f"{model_dir}/quality_model.pkl")
+        duration_model = joblib.load(f"{model_dir}/duration_model.pkl")
+        scaler = joblib.load(f"{model_dir}/scaler.pkl")
+        
+        # Guarda en memoria
+        self.models[f"{agent_id}_quality"] = quality_model
+        self.models[f"{agent_id}_duration"] = duration_model
+        self.scalers[f"{agent_id}_quality"] = scaler
+        self.scalers[f"{agent_id}_duration"] = scaler
+        
+        print(f"📥 Modelos cargados para agente {agent_id}")
+        return True
+        
+    except Exception as e:
+        print(f"❌ Error cargando modelos para {agent_id}: {e}")
+        return False
+
+def save_training_results(self, agent_id: str, quality_accuracy: float, duration_rmse: float, sample_count: int):
+    """Guarda resultados del entrenamiento en la base de datos"""
+    
+    cursor = self.db.connection.cursor()
+    
+    # Actualiza métricas del agente
+    cursor.execute("""
+        UPDATE agents SET 
+            performance_metrics = jsonb_set(
+                performance_metrics, 
+                '{ml_metrics}', 
+                %s::jsonb
+            ),
+            last_training = CURRENT_TIMESTAMP
+        WHERE agent_id = %s
+    """, (json.dumps({
+        "quality_accuracy": quality_accuracy,
+        "duration_rmse": duration_rmse,
+        "training_samples": sample_count,
+        "last_training": datetime.now().isoformat()
+    }), agent_id))
+    
+    # Inserta historial de rendimiento
+    cursor.execute("""
+        INSERT INTO performance_history (agent_id, metric_type, metric_value, metric_context)
+        VALUES 
+            (%s, 'quality_accuracy', %s, %s),
+            (%s, 'duration_rmse', %s, %s)
+    """, (
+        agent_id, quality_accuracy, json.dumps({"training_samples": sample_count}),
+        agent_id, duration_rmse, json.dumps({"training_samples": sample_count})
+    ))
+    
+    self.db.connection.commit()
+    cursor.close()
+
+def predict_task_outcome(self, agent_id: str, task_features: Dict) -> Dict:
+    """Predice el resultado de una tarea para un agente"""
+    
+    quality_key = f"{agent_id}_quality"
+    duration_key = f"{agent_id}_duration"
+    
+    if quality_key not in self.models:
+        if not self.load_agent_model(agent_id):
+            return {"error": "Modelo no disponible para este agente"}
+    
+    # Prepara características
+    features = list(task_features.values())
+    features_array = np.array([features])
+    
+    # Escala características
+    scaler = self.scalers[quality_key]
+    features_scaled = scaler.transform(features_array)
+    
+    # Realiza predicciones
+    quality_model = self.models[quality_key]
+    duration_model = self.models[duration_key]
+    
+    quality_prob = quality_model.predict_proba(features_scaled)[0]
+    predicted_duration = duration_model.predict(features_scaled)[0]
+    
+    return {
+        "agent_id": agent_id,
+        "predicted_high_quality_prob": quality_prob[1] if len(quality_prob) > 1 else quality_prob[0],
+        "predicted_duration": predicted_duration,
+        "confidence": max(quality_prob),
+        "recommendation": "proceed" if quality_prob[1] > 0.7 else "review_assignment"
+    }
+
+def run_automated_training(self) -> Dict:
+    """Ejecuta entrenamiento automático para todos los agentes activos"""
+    
+    cursor = self.db.connection.cursor(cursor_factory=RealDictCursor)
+    cursor.execute("SELECT agent_id FROM agents WHERE is_active = TRUE")
+    agents = cursor.fetchall()
+    cursor.close()
+    
+    results = {}
+    
+    for agent in agents:
+        agent_id = agent['agent_id']
+        try:
+            result = self.train_agent_models(agent_id)
+            results[agent_id] = result
+        except Exception as e:
+            results[agent_id] = {"error": str(e)}
+            print(f"❌ Error entrenando agente {agent_id}: {e}")
+    
+    return {
+        "training_completed": datetime.now().isoformat(),
+        "agents_processed": len(results),
+        "results": results
+    }
+```
+
+# ====================================================================
+
+# 3. SISTEMA DE FINE-TUNING AUTOMÁTICO
+
+# ====================================================================
+
+class AutoTuningSystem:
+“”“Sistema de fine-tuning automático basado en rendimiento”””
+
+```
+def __init__(self, db_manager, ml_system):
+    self.db = db_manager
+    self.ml_system = ml_system
+    
+def analyze_agent_performance(self, agent_id: str) -> Dict:
+    """Analiza el rendimiento de un agente para determinar necesidad de fine-tuning"""
+    
+    cursor = self.db.connection.cursor(cursor_factory=RealDictCursor)
+    
+    # Obtiene métricas recientes
+    cursor.execute("""
+        SELECT 
+            AVG(quality_score) as avg_quality,
+            AVG(actual_duration) as avg_duration,
+            COUNT(*) as task_count,
+            MAX(completed_at) as last_activity
+        FROM tasks t
+        WHERE %s = ANY(SELECT jsonb_array_elements_text(t.agent_ids))
+        AND t.completed_at > CURRENT_TIMESTAMP - INTERVAL '30 days'
+        AND t.status = 'completed'
+    """, (agent_id,))
+    
+    performance = cursor.fetchone()
+    cursor.close()
+    
+    if not performance or performance['task_count'] == 0:
+        return {"recommendation": "insufficient_data", "details": "No hay datos recientes suficientes"}
+    
+    # Determina si necesita fine-tuning
+    needs_tuning = False
+    reasons = []
+    
+    if performance['avg_quality'] < 0.7:
+        needs_tuning = True
+        reasons.append("calidad_baja")
+    
+    if performance['task_count'] >= 20:  # Suficientes datos para reentrenar
+        needs_tuning = True
+        reasons.append("datos_suficientes")
+    
+    # Verifica si ha pasado mucho tiempo desde el último entrenamiento
+    cursor = self.db.connection.cursor()
+    cursor.execute("SELECT last_training FROM agents WHERE agent_id = %s", (agent_id,))
+    last_training = cursor.fetchone()
+    cursor.close()
+    
+    if last_training and last_training[0]:
+        days_since_training = (datetime.now() - last_training[0]).days
+        if days_since_training > 7:
+            needs_tuning = True
+            reasons.append("entrenamiento_antiguo")
+    
+    return {
+        "agent_id": agent_id,
+        "needs_tuning": needs_tuning,
+        "reasons": reasons,
+        "performance": dict(performance),
+        "recommendation": "retrain" if needs_tuning else "maintain"
+    }
+
+def schedule_fine_tuning(self, agent_id: str, tuning_config: Dict = None) -> Dict:
+    """Programa una sesión de fine-tuning para un agente"""
+    
+    if tuning_config is None:
+        tuning_config = {
+            "tuning_type": "performance_based",
+            "hyperparameters": {
+                "learning_rate": 0.01,
+                "batch_size": 32,
+                "epochs": 10
+            },
+            "target_metrics": {
+                "quality_improvement": 0.05,
+                "duration_accuracy": 0.1
+            }
+        }
+    
+    # Guarda configuración de fine-tuning
+    cursor = self.db.connection.cursor()
+    cursor.execute("""
+        INSERT INTO tuning_configurations 
+        (agent_id, tuning_type, hyperparameters, target_metrics)
+        VALUES (%s, %s, %s, %s)
+        RETURNING config_id
+    """, (
+        agent_id,
+        tuning_config["tuning_type"],
+        json.dumps(tuning_config["hyperparameters"]),
+        json.dumps(tuning_config["target_metrics"])
+    ))
+    
+    config_id = cursor.fetchone()[0]
+    self.db.connection.commit()
+    cursor.close()
+    
+    # Ejecuta fine-tuning
+    training_result = self.ml_system.train_agent_models(agent_id)
+    
+    return {
+        "config_id": config_id,
+        "agent_id": agent_id,
+        "tuning_scheduled": datetime.now().isoformat(),
+        "training_result": training_result
+    }
+
+def run_system_optimization(self) -> Dict:
+    """Ejecuta optimización completa del sistema"""
+    
+    print("🔧 Iniciando optimización automática del sistema...")
+    
+    # Obtiene todos los agentes activos
+    cursor = self.db.connection.cursor(cursor_factory=RealDictCursor)
+    cursor.execute("SELECT agent_id FROM agents WHERE is_active = TRUE")
+    agents = cursor.fetchall()
+    cursor.close()
+    
+    optimization_results = {}
+    
+    for agent in agents:
+        agent_id = agent['agent_id']
+        
+        # Analiza rendimiento
+        analysis = self.analyze_agent_performance(agent_id)
+        optimization_results[agent_id] = analysis
+        
+        # Si necesita fine-tuning, lo programa
+        if analysis.get("needs_tuning", False):
+            tuning_result = self.schedule_fine_tuning(agent_id)
+            optimization_results[agent_id]["tuning_result"] = tuning_result
+            print(f"🎯 Fine-tuning programado para agente {agent_id}")
+        else:
+            print(f"✅ Agente {agent_id} funcionando correctamente")
+    
+    return {
+        "optimization_completed": datetime.now().isoformat(),
+        "agents_analyzed": len(agents),
+        "agents_tuned": len([r for r in optimization_results.values() if "tuning_result" in r]),
+        "results": optimization_results
+    }
+```
+
+# ====================================================================
+
+# 4. FUNCIONES DE UTILIDAD Y SETUP
+
+# ====================================================================
+
+def setup_database(db_config: Dict):
+“”“Función para configurar la base de datos inicial”””
+
+```
+print("🗄️ Configurando base de datos PostgreSQL...")
+
+try:
+    # Conecta a PostgreSQL
+    connection = psycopg2.connect(**db_config)
+    cursor = connection.cursor()
+    
+    # Ejecuta script de configuración
+    setup_sql = DatabaseSetup.get_setup_sql()
+    cursor.execute(setup_sql)
+    
+    # Inserta datos de ejemplo
+    sample_data_sql = DatabaseSetup.create_sample_data_sql()
+    cursor.execute(sample_data_sql)
+    
+    connection.commit()
+    cursor.close()
+    connection.close()
+    
+    print("✅ Base de datos configurada exitosamente")
+    return True
+    
+except Exception as e:
+    print(f"❌ Error configurando base de datos: {e}")
+    return False
+```
+
+def create_monitoring_dashboard_data(db_manager) -> Dict:
+“”“Genera datos para un dashboard de monitoreo”””
+
+```
+cursor = db_manager.connection.cursor(cursor_factory=RealDictCursor)
+
+# Estadísticas generales
+cursor.execute("""
+    SELECT 
+        COUNT(*) as total_agents,
+        COUNT(CASE WHEN is_active THEN 1 END) as active_agents
+    FROM agents
+""")
+agent_stats = cursor.fetchone()
+
+cursor.execute("""
+    SELECT 
+        status,
+        COUNT(*) as count
+    FROM tasks
+    GROUP BY status
+""")
+task_stats = cursor.fetchall()
+
+# Rendimiento por agente
+cursor.execute("""
+    SELECT * FROM agent_performance_summary
+    ORDER BY avg_quality DESC
+    LIMIT 10
+""")
+top_performers = cursor.fetchall()
+
+# Efectividad de colaboración
+cursor.execute("SELECT * FROM collaboration_effectiveness")
+collaboration_stats = cursor.fetchall()
+
+cursor.close()
+
+return {
+    "timestamp": datetime.now().isoformat(),
+    "agent_statistics": dict(agent_stats) if agent_stats else {},
+    "task_statistics": {row['status']: row['count'] for row in task_stats},
+    "top_performers": [dict(row) for row in top_performers],
+    "collaboration_effectiveness": [dict(row) for row in collaboration_stats]
+}
+```
+
+# ====================================================================
+
+# EJEMPLO DE USO COMPLETO
+
+# ====================================================================
+
+async def run_complete_ml_demo():
+“”“Demostración completa del sistema de ML”””
+
+```
+# Configuración
+db_config = {
+    'host': 'localhost',
+    'database': 'ai_agents_db',
+    'user': 'postgres',
+    'password': 'tu_password'
+}
+
+# Setup inicial
+print("🚀 Iniciando demostración completa del sistema ML...")
+
+if not setup_database(db_config):
+    print("❌ Error en setup de base de datos")
+    return
+
+# Inicializa sistemas
+from database_manager import DatabaseManager  # Asume que tienes la clase
+
+db_manager = DatabaseManager(db_config)
+db_manager.connect()
+
+ml_system = AgentMLSystem(db_manager)
+tuning_system = AutoTuningSystem(db_manager, ml_system)
+
+# Entrena modelos iniciales
+print("\n1️⃣ Entrenando modelos de ML...")
+training_results = ml_system.run_automated_training()
+print(f"📊 Resultados de entrenamiento: {training_results}")
+
+# Ejecuta optimización del sistema
+print("\n2️⃣ Ejecutando optimización automática...")
+optimization_results = tuning_system.run_system_optimization()
+print(f"🔧 Resultados de optimización: {optimization_results}")
+
+# Genera dashboard de monitoreo
+print("\n3️⃣ Generando datos de monitoreo...")
+dashboard_data = create_monitoring_dashboard_data(db_manager)
+print(f"📊 Dashboard data: {json.dumps(dashboard_data, indent=2, default=str)}")
+
+# Prueba predicción
+print("\n4️⃣ Probando predicción de tareas...")
+sample_task_features = {
+    'task_length': 50,
+    'priority': 2,
+    'agent_count': 1,
+    'collaboration_type_solo': 1,
+    'collaboration_type_parallel': 0,
+    'collaboration_type_sequential': 0,
+    'estimated_duration': 45,
+    'task_complexity': 0.7,
+    'hour_of_day': 14,
+    'day_of_week': 2,
+    'is_weekend': 0
+}
+
+prediction = ml_system.predict_task_outcome('demo_analyst', sample_task_features)
+print(f"🔮 Predicción: {prediction}")
+
+print("\n✅ Demostración completa del sistema ML finalizada exitosamente!")
+```
+
+if **name** == “**main**”:
+import asyncio
+asyncio.run(run_complete_ml_demo())
